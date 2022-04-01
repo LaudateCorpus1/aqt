@@ -85,6 +85,12 @@ flags.DEFINE_string(
     default=None,
     help=('Path to the checkpoint directory of ResNet508b as a teacher model.'))
 
+flags.DEFINE_string(
+    'report_dir',
+    default=None,
+    help=('Directory to save experiment report to after training has '
+          'completed. '))
+
 flags.DEFINE_bool(
     'half_precision',
     default=True,
@@ -230,6 +236,43 @@ def _get_state_dict_keys_from_flags():
   return state_dict_keys
 
 
+
+
+def prepare_and_save_report(
+    hparams: hparams_config.TrainingHParams,
+    eval_freq: int,
+    num_train_steps: int) -> None:
+  """Creates a report for this run and saved it to FLAGS.report_dir."""
+  # For models with quantization, we should only do early stopping after the
+  # model is quantized during training, so after
+  # hparams.activation_bound_start_step. (For models with quantized weights,
+  # weights are quantized from the beginning of training.)
+  # However, for unquantized activations, hparams.activation_bound_start_step is
+  # set to -1, but the report start_step cannot be negative, so the max()
+  # sets the start_step to 0 in this case.
+  report_start_step = max(0, hparams.activation_bound_start_step)
+  report = report_utils.create_end_of_training_report(
+      model_dir=FLAGS.model_dir,
+      eval_freq=eval_freq,
+      num_train_steps=num_train_steps,
+      early_stop_attr='eval_accuracy',
+      early_stop_agg=report_utils.MinOrMax.MAX,
+      early_stop_ds_dir=None,
+      smoothing_kernel=report_utils.SmoothingKernel.TRIANGULAR,
+      other_ds_dirs=None,
+      tags_to_include=[
+          'eval_accuracy', 'eval_loss', 'train_accuracy', 'train_loss',
+          'train_learning_rate'
+      ],
+      window_size_in_steps=eval_freq * 5,
+      start_step=report_start_step)
+  logging.info('report created.')
+  if FLAGS.report_dir is None:
+    report_dir = FLAGS.model_dir
+  else:
+    report_dir = FLAGS.report_dir
+  report_path = report_utils.save_report(report, report_dir)
+  logging.info('Report saved to %s.', str(report_path))
 
 
 def main(argv):
@@ -476,6 +519,10 @@ def main(argv):
           summary_writer.scalar(tag, val.mean(), step)
         summary_writer.flush()
     if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
+      # Only save the report when step > activation_bound_start_step
+      if jax.host_id() == 0 and step > hparams.activation_bound_start_step:
+        prepare_and_save_report(
+            hparams, eval_freq=steps_per_epoch, num_train_steps=step + 1)
       state = imagenet_train_utils.sync_batch_stats(state)
       save_checkpoint(state)
 
